@@ -1,0 +1,89 @@
+{
+    "version": 8,
+    "name": "My Offline Map",
+    "glyphs": "./assets/noto-sans/{fontstack}/{range}.pbf",
+    "sprite": "./assets/sprites/sprite",
+    "sources": {
+        "openmaptiles": {
+            "type": "vector",
+            "url": "pmtiles://./assets/maps/my-area.pmtiles"
+        }
+    },
+    "layers": [
+        {
+            "id": "water",
+            "type": "fill",
+            "source": "openmaptiles",
+            "source-layer": "water",
+            "filter": [
+                "==",
+                "$type",
+                "Polygon"
+            ],
+            "paint": {
+                "fill-color": "#bbddff"
+            }
+        },
+        {
+            "id": "landuse",
+            "type": "fill",
+            "source": "openmaptiles",
+            "source-layer": "landuse",
+            "filter": [
+                "in",
+                "class",
+                "park",
+                "forest",
+                "nature"
+            ],
+            "paint": {
+                "fill-color": "#e6eed6"
+            }
+        },
+        {
+            "id": "road_major",
+            "type": "line",
+            "source": "openmaptiles",
+            "source-layer": "road",
+            "filter": [
+                "in",
+                "class",
+                "motorway",
+                "trunk",
+                "primary"
+            ],
+            "layout": {
+                "line-cap": "round",
+                "line-join": "round"
+            },
+            "paint": {
+                "line-color": "#ffffff",
+                "line-width": 4
+            }
+        },
+        {
+            "id": "road_labels",
+            "type": "symbol",
+            "source": "openmaptiles",
+            "source-layer": "road",
+            "filter": [
+                "has",
+                "name"
+            ],
+            "layout": {
+                "text-field": [
+                    "get",
+                    "name"
+                ],
+                "text-font": [
+                    "Noto Sans Regular"
+                ], 
+                "symbol-placement": "line",
+                "text-size": 10
+            },
+            "paint": {
+                "text-color": "#333333"
+            }
+        }
+    ]
+}
