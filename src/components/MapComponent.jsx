@@ -1,19 +1,17 @@
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import { useDispatch, useSelector } from 'react-redux';
 import { fetchBuildings, setRoute, setError } from '../redux/mapSlice';
 import axios from 'axios';
 import InfoPanel from './InfoPanel';
 import View360 from './View360';
-// import DataEntryForm from './DataEntryForm'; // Kept commented
 
 // --- CONFIGURATION CONSTANTS ---
-// NOTE: Ensure you've addressed the 401 error with Stadia Maps API Key.
-// The URL needs the API key appended if you want to use the map style.
 const MAP_STYLE_URL = 'https://tiles.stadiamaps.com/styles/alidade_satellite.json';
-const GOOGLE_EMBED_URL = 'https://maps.google.com/maps?q=Wolverhampton+WV10+9DS&z=15&output=embed';
 const API_BASE_URL = 'https://ins-back-end.onrender.com/api/map'; // Express Backend
 const DEFAULT_CENTER = { lng: 83.23, lat: 17.72, zoom: 14, pitch: 65 };
+const NOMINATIM_API_URL = 'https://nominatim.openstreetmap.org/search';
+const REVERSE_NOMINATIM_API_URL = 'https://nominatim.openstreetmap.org/reverse';
 
 // --- GeoJSON Source/Layer IDs ---
 const ROUTE_POINT_SOURCE_ID = 'route-point-source';
@@ -29,29 +27,109 @@ const MAX_COLLECTED_POINTS = 155;
 // Category options for filtering
 const CATEGORY_OPTIONS = ['All', 'Building', 'Cabin', 'Security Pillar', 'Gate', 'Other', "main"];
 const BUILDING_LAYER_ID = 'buildings-3d';
-const PHOTO_MARKER_LAYER_ID = 'building-photo-markers';
+const PHOTO_MARKER_LAYER_ID = 'building-marker'; // Consistent name for photo marker layer
+const DEBOUNCE_DELAY = 300;
 
-// --- STYLING CONSTANTS (For better readability) ---
-const COLOR_GOLD = '#d4af37'; // Default Feature color
-const COLOR_PURPLE = '#9400d3'; // Filtered Feature color
-const COLOR_ROUTE_GREEN = '#047857'; // Route line color
+// --- STYLING CONSTANTS ---
+const COLOR_GOLD = '#d4af37';
+const COLOR_PURPLE = '#9400d3';
+const COLOR_ROUTE_GREEN = '#047857';
+
+
+// --- API FUNCTIONS (Retained from original input) ---
+
+// Forward Geocoding (Search & Suggestions)
+const fetchCoordinates = async (query, limit = 1) => {
+    if (limit > 1 && query.length < 3) return [];
+
+    try {
+        const response = await axios.get(NOMINATIM_API_URL, {
+            params: { q: query, format: 'json', limit: limit, addressdetails: 1 }
+        });
+
+        if (response.data && response.data.length > 0) {
+            return response.data.map(result => ({
+                name: result.display_name,
+                lng: parseFloat(result.lon),
+                lat: parseFloat(result.lat),
+                zoom: result.type === 'city' || result.type === 'administrative' ? 12 : 14
+            }));
+        } else {
+            return [];
+        }
+    } catch (error) {
+        return [];
+    }
+};
+
+// Reverse Geocoding (Pincode/Address Lookup on Map Click)
+const fetchPincodeAndAddress = async (lat, lng) => {
+    try {
+        const response = await axios.get(REVERSE_NOMINATIM_API_URL, {
+            params: {
+                lat: lat,
+                lon: lng,
+                format: 'json',
+                addressdetails: 1,
+                zoom: 18
+            }
+        });
+
+        if (response.data && response.data.address) {
+            const address = response.data.address;
+            const pincode = address.postcode || 'N/A';
+            const fullAddress = response.data.display_name || 'Address Not Found';
+
+            return {
+                pincode: pincode,
+                latitude: lat.toFixed(6),
+                longitude: lng.toFixed(6),
+                fullAddress: fullAddress
+            };
+        } else {
+            return {
+                pincode: 'N/A',
+                latitude: lat.toFixed(6),
+                longitude: lng.toFixed(6),
+                fullAddress: 'No Address Data Found'
+            };
+        }
+    } catch (error) {
+        console.error("Reverse Geocoding failed:", error);
+        return {
+            pincode: 'Error',
+            latitude: lat.toFixed(6),
+            longitude: lng.toFixed(6),
+            fullAddress: 'Service Error'
+        };
+    }
+};
 
 
 function MapComponent() {
     const mapContainer = useRef(null);
     const map = useRef(null);
+    const debounceTimeout = useRef(null);
 
-    // State management
-    const [mapCenter, setMapCenter] = React.useState({ lng: 83.21, lat: 17.72 });
-    const [selectedFeature, setSelectedFeature] = React.useState(null);
-    const [view360Url, setView360Url] = React.useState(null);
-    const [activeCategory, setActiveCategory] = React.useState('All'); // Category filter state
-    const [isCoordinateFormOpen, setIsCoordinateFormOpen] = React.useState(false);
+    // --- NEW SEARCH & GEOCODING STATES ---
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchSuggestions, setSearchSuggestions] = useState([]);
+    const [searchError, setSearchError] = useState(null);
+    const [reverseGeocodeInfo, setReverseGeocodeInfo] = useState(null);
+    const [isReverseGeocoding, setIsReverseGeocoding] = useState(false);
 
-    // Interaction States
-    const [routePoints, setRoutePoints] = React.useState([]);
-    const [loggedClicks, setLoggedClicks] = React.useState([]); // For general click logging
-    const [collectedCoordinates, setCollectedCoordinates] = React.useState([]); // Right-click data collection
+    // State management (from original)
+    const [mapCenter, setMapCenter] = useState({ lng: 83.21, lat: 17.72 });
+    const [selectedFeature, setSelectedFeature] = useState(null);
+    const [view360Url, setView360Url] = useState(null);
+    // RESTORED: Internal state for category filtering
+    const [activeCategory, setActiveCategory] = useState('All');
+    const [isCoordinateFormOpen, setIsCoordinateFormOpen] = useState(false);
+
+    // Interaction States (from original)
+    const [routePoints, setRoutePoints] = useState([]);
+    const [loggedClicks, setLoggedClicks] = useState([]);
+    const [collectedCoordinates, setCollectedCoordinates] = useState([]);
 
     // Redux Hooks
     const dispatch = useDispatch();
@@ -59,57 +137,66 @@ function MapComponent() {
 
     // --- HANDLERS ---
 
+    // Map flyto helper
+    const flyToLocation = useCallback((lng, lat, zoom) => {
+        if (map.current) {
+            map.current.flyTo({
+                center: [lng, lat],
+                zoom: zoom || 14,
+                essential: true
+            });
+            setSearchSuggestions([]);
+            setSearchQuery('');
+            setSearchError(null);
+            setReverseGeocodeInfo(null); // Clear manual click info on search fly
+        }
+    }, []);
+
+    // Reverse Geocoding Handler
+    const handleReverseGeocode = useCallback(async (lng, lat) => {
+        setIsReverseGeocoding(true);
+        const info = await fetchPincodeAndAddress(lat, lng);
+        setReverseGeocodeInfo(info);
+        setIsReverseGeocoding(false);
+    }, []);
+
+    // Primary Search Handler
+    const handleSearch = useCallback(async (e) => {
+        e.preventDefault();
+        setSearchError(null);
+        setSearchSuggestions([]);
+        if (!map.current || !searchQuery.trim()) return;
+
+        try {
+            const results = await fetchCoordinates(searchQuery.trim(), 1);
+            if (results.length > 0) {
+                const { lng, lat, zoom } = results[0];
+                flyToLocation(lng, lat, zoom);
+            } else {
+                setSearchError("Location/Pincode not found or ambiguous.");
+            }
+        } catch (err) {
+            setSearchError(err.message || "Search service failed to connect.");
+        }
+    }, [searchQuery, flyToLocation]);
+
+
     // Resets ONLY the collected coordinates
     const resetCollectedCoordinates = useCallback(() => {
         setCollectedCoordinates([]);
-        // Optionally close form if it was reset to empty
         if (collectedCoordinates.length === 0) setIsCoordinateFormOpen(false);
     }, [collectedCoordinates.length]);
 
     // Handler to close the InfoPanel/Clear selected feature
     const handleCancelInfoPanel = useCallback(() => {
         setSelectedFeature(null);
-        setView360Url(null); // Clear 360 view URL as well
+        setView360Url(null);
     }, []);
 
-    // Sets the active category filter
+    // RESTORED: Sets the active category filter
     const handleCategoryClick = (category) => {
         setActiveCategory(category);
     };
-
-    // Resets the map view and clears all interactions/states
-    const resetMapView = useCallback(() => {
-        if (map.current) {
-            map.current.flyTo({
-                center: [DEFAULT_CENTER.lng, DEFAULT_CENTER.lat],
-                zoom: DEFAULT_CENTER.zoom,
-                pitch: DEFAULT_CENTER.pitch,
-                bearing: 0,
-                essential: true
-            });
-            // Clear all interactions and states
-            setRoutePoints([]);
-            setCollectedCoordinates([]);
-            setLoggedClicks([]);
-            dispatch(setRoute(null));
-            setSelectedFeature(null);
-            setView360Url(null);
-            setIsCoordinateFormOpen(false);
-            setActiveCategory('All');
-
-            // Clear map-drawn layers explicitly if they exist
-            if (map.current.getSource(BOX_SOURCE_ID)) {
-                map.current.getSource(BOX_SOURCE_ID).setData({ type: 'FeatureCollection', features: [] });
-            }
-        }
-    }, [dispatch]);
-
-    // --- ROUTING FUNCTIONALITY ---
-
-    // Fetch buildings once on mount
-    useEffect(() => {
-        dispatch(fetchBuildings());
-    }, [dispatch]);
 
     // Calculates and displays route from map center to a target point
     const handleRoute = useCallback(async (endPoint) => {
@@ -129,27 +216,73 @@ function MapComponent() {
         }
     }, [dispatch]);
 
-    // Calculates and displays route between two predefined points (Used only inside useEffect currently)
-    const calculateRouteBetweenPoints = useCallback(async (startPoint, endPoint) => {
-        try {
-            dispatch(setRoute(null));
-            const response = await axios.post(`${API_BASE_URL}/route`, {
-                startLng: startPoint.lng, startLat: startPoint.lat,
-                endLng: endPoint.lng, endLat: endPoint.lat
+    // Resets the map view and clears all interactions/states
+    const resetMapView = useCallback(() => {
+        if (map.current) {
+            map.current.flyTo({
+                center: [DEFAULT_CENTER.lng, DEFAULT_CENTER.lat],
+                zoom: DEFAULT_CENTER.zoom,
+                pitch: DEFAULT_CENTER.pitch,
+                bearing: 0,
+                essential: true
             });
-            dispatch(setRoute(response.data));
-            map.current.flyTo({ center: [startPoint.lng, startPoint.lat], zoom: 15, essential: true });
-            setRoutePoints([]); // Clear temporary route markers
-        } catch (err) {
-            console.error("Routing failed:", err);
-            dispatch(setError("Routing failed. Check routing service connection."));
+            // Clear all interactions and states
+            setRoutePoints([]);
+            setCollectedCoordinates([]);
+            setLoggedClicks([]);
+            dispatch(setRoute(null));
+            setSelectedFeature(null);
+            setView360Url(null);
+            setIsCoordinateFormOpen(false);
+            setActiveCategory('All'); // RESTORED: Reset category state
+            setSearchSuggestions([]);
+            setReverseGeocodeInfo(null);
+
+            if (map.current.getSource(BOX_SOURCE_ID)) {
+                map.current.getSource(BOX_SOURCE_ID).setData({ type: 'FeatureCollection', features: [] });
+            }
         }
     }, [dispatch]);
 
 
-    // --- MAPLIBRE INITIALIZATION & EVENT HANDLERS ---
+    // --- EFFECTS ---
+
+    // Fetch buildings once on mount
     useEffect(() => {
-        if (map.current || !buildings) return; // Skip if already initialized or data is missing
+        dispatch(fetchBuildings());
+    }, [dispatch]);
+
+    // Autosuggest Debounced Fetch
+    useEffect(() => {
+        if (debounceTimeout.current) {
+            clearTimeout(debounceTimeout.current);
+        }
+
+        if (searchQuery.length < 3) {
+            setSearchSuggestions([]);
+            return;
+        }
+
+        debounceTimeout.current = setTimeout(async () => {
+            try {
+                const suggestions = await fetchCoordinates(searchQuery, 5);
+                setSearchSuggestions(suggestions);
+            } catch (err) {
+                // Ignore silent fetch errors for suggestions
+            }
+        }, DEBOUNCE_DELAY);
+
+        return () => {
+            if (debounceTimeout.current) {
+                clearTimeout(debounceTimeout.current);
+            }
+        };
+    }, [searchQuery]);
+
+
+    // MAPLIBRE INITIALIZATION & EVENT HANDLERS
+    useEffect(() => {
+        if (map.current || !buildings) return;
 
         map.current = new maplibregl.Map({
             container: mapContainer.current,
@@ -169,7 +302,6 @@ function MapComponent() {
             const buttonType = e.originalEvent.button === 0 ? 'LEFT' : (e.originalEvent.button === 2 ? 'RIGHT' : 'OTHER');
             const newClick = { lng: lng.toFixed(4), lat: lat.toFixed(4), button: buttonType };
 
-            // Log all clicks
             setLoggedClicks(prev => [newClick, ...prev.slice(0, MAX_LOGGED_CLICKS - 1)]);
 
             if (e.originalEvent.button === 2) { // Right-click (Context menu)
@@ -191,11 +323,11 @@ function MapComponent() {
             }
         });
 
-        // Handler 2: LEFT-CLICK (Feature Selection or Clearing)
+        // Handler 2: LEFT-CLICK (Reverse Geocoding or Clearing)
         map.current.on('click', (e) => {
             if (e.originalEvent.button !== 0) return; // Only process left-click
+            const { lng, lat } = e.lngLat;
 
-            // Check if a point/marker/building feature was clicked
             const features = map.current.queryRenderedFeatures(e.point);
             const isFeatureClicked = features.some(f =>
                 f.layer.id === BUILDING_LAYER_ID ||
@@ -204,19 +336,22 @@ function MapComponent() {
             );
 
             if (isFeatureClicked) {
-                // Let the specific layer click handlers (below) manage the action
+                // If a feature was clicked, stop the click handler so the feature logic can run.
+                setReverseGeocodeInfo(null);
                 return;
             }
 
-            // Clear all states if empty space is clicked
+            // Clear map interaction states
             if (routePoints.length > 0 || route) {
                 setRoutePoints([]);
                 dispatch(setRoute(null));
             }
-
-            // Clear selected feature/360 view if empty space is clicked
             setSelectedFeature(null);
             setView360Url(null);
+            setSearchSuggestions([]);
+
+            // Perform Reverse Geocoding for the clicked point
+            handleReverseGeocode(lng, lat);
         });
 
         // Handler 3: CONTEXT MENU (Right-Click for 360 View - overrides default browser menu)
@@ -252,7 +387,7 @@ function MapComponent() {
                 if (map.current.getSource(id)) map.current.removeSource(id);
             };
 
-            // Cleanup existing layers before adding new ones (Good practice)
+            // Cleanup layers/sources
             cleanupLayersAndSources(BUILDING_LAYER_ID);
             cleanupLayersAndSources('buildings');
             cleanupLayersAndSources('viewpoint-markers');
@@ -272,11 +407,9 @@ function MapComponent() {
             const viewpointMarkers = {
                 type: "FeatureCollection", features: buildings.features.map(feature => {
                     let pointCoords;
-                    // Prioritize dedicated viewpoint coordinates
                     if (feature.properties.viewpoint && feature.properties.viewpoint.coordinates) {
                         pointCoords = feature.properties.viewpoint.coordinates;
                     } else if (feature.geometry.coordinates && feature.geometry.coordinates.length > 0 && feature.geometry.type === 'Polygon') {
-                        // Calculate center point of the polygon as fallback
                         const coords = feature.geometry.coordinates[0];
                         const centerLng = coords.reduce((sum, p) => sum + p[0], 0) / coords.length;
                         const centerLat = coords.reduce((sum, p) => sum + p[1], 0) / coords.length;
@@ -303,103 +436,52 @@ function MapComponent() {
 
 
             // --- Add Layers ---
-            // 3D Buildings Layer
             map.current.addLayer({
-                'id': BUILDING_LAYER_ID,
-                'type': 'fill-extrusion',
-                'source': 'buildings',
-                'paint': {
-                    'fill-extrusion-color': COLOR_GOLD, // Default Gold
-                    'fill-extrusion-height': ['get', 'height'],
-                    'fill-extrusion-base': 0,
-                    'fill-extrusion-opacity': 1
-                }
+                'id': BUILDING_LAYER_ID, 'type': 'fill-extrusion', 'source': 'buildings',
+                'paint': { 'fill-extrusion-color': COLOR_GOLD, 'fill-extrusion-height': ['get', 'height'], 'fill-extrusion-base': 0, 'fill-extrusion-opacity': 1 }
             });
-
-            // Route points (start/end markers)
             map.current.addLayer({
-                'id': ROUTE_POINT_LAYER_ID,
-                'type': 'circle',
-                'source': ROUTE_POINT_SOURCE_ID,
-                'paint': {
-                    // Match the color based on point index (0=Start, 1=End)
-                    'circle-color': ['match', ['get', 'index'], 0, COLOR_ROUTE_GREEN, 1, '#b91c1c', '#333'],
-                    'circle-radius': 10,
-                    'circle-stroke-width': 2,
-                    'circle-stroke-color': '#ffffff'
-                }
+                'id': ROUTE_POINT_LAYER_ID, 'type': 'circle', 'source': ROUTE_POINT_SOURCE_ID,
+                'paint': { 'circle-color': ['match', ['get', 'index'], 0, COLOR_ROUTE_GREEN, 1, '#b91c1c', '#333'], 'circle-radius': 10, 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' }
             });
-
-            // Drawn box (Polygon tool) - Assuming you only use drawnPolygonCoords now
             map.current.addLayer({
-                'id': BOX_LAYER_ID,
-                'type': 'fill',
-                'source': BOX_SOURCE_ID,
-                'layout': {},
+                'id': BOX_LAYER_ID, 'type': 'fill', 'source': BOX_SOURCE_SOURCE_ID, 'layout': {},
                 'paint': { 'fill-color': COLOR_GOLD, 'fill-opacity': 0.3, 'fill-outline-color': COLOR_GOLD }
             });
-
-            // Logged clicks (gray)
             map.current.addLayer({
-                'id': 'clicked-points-layer',
-                'type': 'circle',
-                'source': CLICKED_POINTS_SOURCE_ID,
+                'id': 'clicked-points-layer', 'type': 'circle', 'source': CLICKED_POINTS_SOURCE_ID,
                 'paint': { 'circle-color': '#6b7280', 'circle-radius': 4, 'circle-stroke-width': 1, 'circle-stroke-color': '#ffffff' }
             });
 
-            // --- 360 Photo Marker Logic (Symbol Layer) ---
+            // 360 Photo Marker Logic (Symbol Layer)
             map.current.loadImage('/camera-icon.png', (error, image) => {
                 if (!error && !map.current.hasImage('camera-icon')) {
                     map.current.addImage('camera-icon', image, { pixelRatio: 2 });
-
                     map.current.addLayer({
-                        'id': PHOTO_MARKER_LAYER_ID,
-                        'type': 'symbol',
-                        'source': 'viewpoint-source',
-                        'layout': {
-                            'icon-image': 'camera-icon',
-                            'icon-size': 0.12,
-                            // Only visible if imageURL property exists
-                            'visibility': ['case', ['has', 'imageURL'], 'visible', 'none']
-                        },
+                        'id': PHOTO_MARKER_LAYER_ID, 'type': 'symbol', 'source': 'viewpoint-source',
+                        'layout': { 'icon-image': 'camera-icon', 'icon-size': 0.12, 'visibility': ['case', ['has', 'imageURL'], 'visible', 'none'] },
                         'filter': ['has', 'imageURL']
                     });
                 }
             });
 
             // --- Feature Click Handlers ---
-
-            // 1. Building Click (Left-Click)
             map.current.on('click', BUILDING_LAYER_ID, (e) => {
                 const feature = e.features[0];
                 const coords = feature.geometry.coordinates[0];
-                // Calculate polygon center for InfoPanel display
                 const centerLng = coords.reduce((sum, p) => sum + p[0], 0) / coords.length;
                 const centerLat = coords.reduce((sum, p) => sum + p[1], 0) / coords.length;
-
-                setSelectedFeature({
-                    name: feature.properties.name,
-                    id: feature.properties.id,
-                    imageURL: feature.properties.imageURL,
-                    category: feature.properties.category,
-                    centerPoint: { lng: centerLng, lat: centerLat }
-                });
+                setSelectedFeature({ name: feature.properties.name, id: feature.properties.id, imageURL: feature.properties.imageURL, category: feature.properties.category, centerPoint: { lng: centerLng, lat: centerLat } });
                 map.current.flyTo({ center: [centerLng, centerLat], pitch: 60, zoom: 16 });
+                setReverseGeocodeInfo(null);
             });
 
-            // 2. 360 View Marker Click (Left-Click)
             map.current.on('click', PHOTO_MARKER_LAYER_ID, (e) => {
                 const feature = e.features[0];
-                setSelectedFeature({
-                    name: feature.properties.name,
-                    id: feature.properties.id,
-                    imageURL: feature.properties.imageURL,
-                    category: feature.properties.category,
-                    centerPoint: { lng: feature.geometry.coordinates[0], lat: feature.geometry.coordinates[1] }
-                });
-
+                setSelectedFeature({ name: feature.properties.name, id: feature.properties.id, imageURL: feature.properties.imageURL, category: feature.properties.category, centerPoint: { lng: feature.geometry.coordinates[0], lat: feature.geometry.coordinates[1] } });
                 if (feature.properties.imageURL) { setView360Url(feature.properties.imageURL); }
                 map.current.flyTo({ center: feature.geometry.coordinates, pitch: 60, zoom: 16 });
+                setReverseGeocodeInfo(null);
             });
         });
 
@@ -408,36 +490,27 @@ function MapComponent() {
             map.current?.remove();
             map.current = null;
         };
-    }, [buildings, dispatch]);
+    }, [buildings, dispatch, handleReverseGeocode]);
 
 
     // --- EFFECT: CATEGORY FILTERING AND COLORING LOGIC ---
     useEffect(() => {
         if (!map.current || !map.current.isStyleLoaded()) return;
 
-        // 1. Determine Color
         const extrusionColor = activeCategory === 'All' ? COLOR_GOLD : COLOR_PURPLE;
 
-        // 2. Apply Filter and Color to 3D Buildings
         if (map.current.getLayer(BUILDING_LAYER_ID)) {
             map.current.setPaintProperty(BUILDING_LAYER_ID, 'fill-extrusion-color', extrusionColor);
-
-            if (activeCategory === 'All') {
-                map.current.setFilter(BUILDING_LAYER_ID, null);
-            } else {
-                map.current.setFilter(BUILDING_LAYER_ID, ['==', ['get', 'category'], activeCategory]);
-            }
+            map.current.setFilter(BUILDING_LAYER_ID, activeCategory === 'All' ? null : ['==', ['get', 'category'], activeCategory]);
         }
 
-        // 3. Apply Filter to Photo Markers
         if (map.current.getLayer(PHOTO_MARKER_LAYER_ID)) {
-            if (activeCategory === 'All') {
-                map.current.setFilter(PHOTO_MARKER_LAYER_ID, ['has', 'imageURL']);
-            } else {
-                map.current.setFilter(PHOTO_MARKER_LAYER_ID, ['all', ['has', 'imageURL'], ['==', ['get', 'category'], activeCategory]]);
-            }
+            map.current.setFilter(PHOTO_MARKER_LAYER_ID, activeCategory === 'All'
+                ? ['has', 'imageURL']
+                : ['all', ['has', 'imageURL'], ['==', ['get', 'category'], activeCategory]]
+            );
         }
-    }, [activeCategory]);
+    }, [activeCategory]); // Depends on internal activeCategory state
 
     // --- EFFECT: ROUTE LINE RENDERING ---
     useEffect(() => {
@@ -453,19 +526,12 @@ function MapComponent() {
             } else {
                 map.current.addSource(routeSourceId, { type: 'geojson', data: route });
                 map.current.addLayer({
-                    'id': routeLayerId,
-                    'type': 'line',
-                    'source': routeSourceId,
+                    'id': routeLayerId, 'type': 'line', 'source': routeSourceId,
                     'layout': { 'line-join': 'round', 'line-cap': 'round' },
-                    'paint': {
-                        'line-color': COLOR_ROUTE_GREEN,
-                        'line-width': 6,
-                        'line-dasharray': [2, 1]
-                    }
+                    'paint': { 'line-color': COLOR_ROUTE_GREEN, 'line-width': 6, 'line-dasharray': [2, 1] }
                 });
             }
         } else if (!route && sourceExists) {
-            // Clear the route line if route is null
             map.current.getSource(routeSourceId).setData({ type: 'FeatureCollection', features: [] });
         }
     }, [route]);
@@ -477,12 +543,10 @@ function MapComponent() {
         const routeGeoJSON = {
             type: 'FeatureCollection',
             features: routePoints.map((point, index) => ({
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [point.lng, point.lat] },
+                type: 'Feature', geometry: { type: 'Point', coordinates: [point.lng, point.lat] },
                 properties: { id: `route-point-${index}`, index: index }
             }))
         };
-
         if (map.current.getSource(ROUTE_POINT_SOURCE_ID)) {
             map.current.getSource(ROUTE_POINT_SOURCE_ID).setData(routeGeoJSON);
         }
@@ -492,26 +556,16 @@ function MapComponent() {
     useEffect(() => {
         if (!map.current || !map.current.isStyleLoaded()) return;
 
-        // Ensure the source and layer exist
         if (!map.current.getSource(COLLECTED_COORDS_SOURCE_ID)) {
             map.current.addSource(COLLECTED_COORDS_SOURCE_ID, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
             map.current.addLayer({
-                'id': COLLECTED_COORDS_LAYER_ID,
-                'type': 'circle',
-                'source': COLLECTED_COORDS_SOURCE_ID,
-                'paint': {
-                    'circle-color': COLOR_GOLD,
-                    'circle-radius': 7,
-                    'circle-stroke-width': 2,
-                    'circle-stroke-color': '#ffffff'
-                }
+                'id': COLLECTED_COORDS_LAYER_ID, 'type': 'circle', 'source': COLLECTED_COORDS_SOURCE_ID,
+                'paint': { 'circle-color': COLOR_GOLD, 'circle-radius': 7, 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' }
             });
         }
 
         const features = collectedCoordinates.map(point => ({
-            type: 'Feature',
-            geometry: { type: 'Point', coordinates: [parseFloat(point.lng), parseFloat(point.lat)] },
-            properties: {}
+            type: 'Feature', geometry: { type: 'Point', coordinates: [parseFloat(point.lng), parseFloat(point.lat)] }, properties: {}
         }));
 
         map.current.getSource(COLLECTED_COORDS_SOURCE_ID).setData({ type: 'FeatureCollection', features });
@@ -519,7 +573,31 @@ function MapComponent() {
     }, [collectedCoordinates]);
 
 
-    // --- RENDER HELPERS ---
+    // --- RENDER HELPERS: Reverse Geocoding Panel ---
+    const getReverseGeocodePanel = () => {
+        if (!reverseGeocodeInfo && !isReverseGeocoding) return null;
+
+        return (
+            <div className="mt-4 p-3 bg-blue-950/70 backdrop-blur-sm rounded-lg shadow-xl text-xs sm:text-sm font-mono text-amber-300 border border-amber-300/30">
+                <p className="font-serif font-bold text-white mb-2 border-b border-amber-300/30 pb-1">
+                    Clicked Location Data
+                </p>
+                {isReverseGeocoding ? (
+                    <p className="text-yellow-400">Fetching Pincode... 📡</p>
+                ) : (
+                    <>
+                        <p className="truncate text-gray-300"><span className="text-gray-500">Address:</span> {reverseGeocodeInfo.fullAddress}</p>
+                        <p className="text-amber-300/90"><span className="text-gray-500">Pincode:</span> **{reverseGeocodeInfo.pincode}**</p>
+                        <p className="text-amber-300/90"><span className="text-gray-500">Lat:</span> **{reverseGeocodeInfo.latitude}**</p>
+                        <p className="text-amber-300/90"><span className="text-gray-500">Long:</span> **{reverseGeocodeInfo.longitude}**</p>
+                    </>
+                )}
+            </div>
+        );
+    };
+
+
+    // --- RENDER HELPERS: Data Acquisition / Interaction Log ---
 
     const getCollectedCoordsDisplay = () => {
         if (!isCoordinateFormOpen) return null;
@@ -578,71 +656,142 @@ function MapComponent() {
 
             {/* Map Container */}
             <div className="w-full h-screen absolute top-0 left-0">
-                {/* The Google Embed logic was removed as it was always false and cluttered the main useEffect dependency array. */}
                 <div ref={mapContainer} className="w-full h-full" />
             </div>
 
-            {/* Open/Close Coordinate Form Button (Top Left) */}
-            <button
-                onClick={() => setIsCoordinateFormOpen(prev => !prev)}
-                className="absolute top-4 left-4 bg-blue-950 hover:bg-amber-600 text-amber-300 font-serif font-bold py-2 px-6 rounded-full shadow-2xl z-20 transition duration-500 tracking-wider border border-amber-300/50"
+            {/* 1. Search Bar & Suggestions + Reverse Geocoding Panel (Top Left Container) */}
+            <div className="absolute top-4 left-4 z-30 w-80 max-w-[90%]">
+
+                {/* Search Form (Luxury Style) */}
+                <form
+                    onSubmit={handleSearch}
+                    className="flex shadow-2xl rounded-lg overflow-hidden border-2 border-amber-300/70"
+                >
+                    <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Search Location or Pincode..."
+                        className="flex-grow p-3 text-sm font-serif tracking-wide text-stone-900 bg-amber-200 focus:bg-white placeholder-stone-700 focus:outline-none transition duration-150"
+                    />
+                    <button
+                        type="submit"
+                        className="p-3 bg-blue-950 hover:bg-amber-600 transition duration-300 text-amber-300 font-bold text-sm flex-shrink-0"
+                    >
+                        <span className="hidden sm:inline">Search</span> 🔍
+                    </button>
+                </form>
+
+                {/* Search Suggestions Dropdown */}
+                {searchSuggestions.length > 0 && (
+                    <div className="mt-1 bg-stone-950/95 backdrop-blur-sm rounded-lg shadow-2xl border border-amber-300/50 max-h-60 overflow-y-auto">
+                        {searchSuggestions.map((suggestion, index) => (
+                            <div
+                                key={index}
+                                onClick={() => flyToLocation(suggestion.lng, suggestion.lat, suggestion.zoom)}
+                                className="p-3 text-xs text-amber-300 hover:bg-blue-900/80 cursor-pointer border-b border-amber-300/20 last:border-b-0 transition duration-100"
+                            >
+                                <p className="font-semibold">{suggestion.name}</p>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {/* Search Error */}
+                {searchError && (
+                    <div className="mt-2 bg-red-900 p-2 text-xs text-amber-300 rounded shadow-lg">
+                        {searchError}
+                    </div>
+                )}
+
+                {/* Reverse Geocoding Panel */}
+                {getReverseGeocodePanel()}
+            </div>
+
+
+            {/* 2. Coordinate Display & Status Overlay (Top Right - Map Console) */}
+            <div
+                className="absolute top-4 right-4 bg-stone-950/70 backdrop-blur-sm p-4 rounded-xl shadow-2xl z-20 text-base font-mono text-amber-300 border border-amber-300/30"
+                style={{ maxWidth: '300px', maxHeight: '50vh' }}
             >
-                {isCoordinateFormOpen ? 'Close Data Acquisition' : 'Open Data Acquisition'}
-            </button>
+                <p className="text-lg font-serif tracking-widest text-white mb-2">Imperial Map Console</p>
+                {/* Longitude and Latitude coordinates REMOVED from the Top Right Console */}
 
-            {/* Reset Map View Button (Bottom Right) */}
-            {map.current && (
+                {getCollectedCoordsDisplay()}
+                {getAllClickedCoordsDisplay()}
+            </div>
+
+            {/* 3. Single Fixed Horizontal Bottom Bar for ALL Controls - RESTORED CATEGORY BUTTONS */}
+            <div
+                className="fixed bottom-0 left-0 right-0 p-2 bg-blue-950/80 backdrop-blur-sm shadow-2xl z-30 flex items-center gap-2 overflow-x-auto whitespace-nowrap border-t border-amber-300/30"
+                style={{ height: '4rem' }}
+            >
+
+                {/* Reset Map Button (Start of Bar) */}
+                {map.current && (
+                    <button
+                        onClick={resetMapView}
+                        className="bg-stone-800/80 hover:bg-stone-900 text-amber-300 font-serif py-1.5 px-4 rounded-full shadow-lg transition duration-300 border border-white/20 text-xs sm:text-sm flex-shrink-0"
+                    >
+                        Reset Map 🌍
+                    </button>
+                )}
+
+                {/* NEW: Map Coordinates Display in the Bottom Bar */}
+                <div className="hidden sm:flex text-amber-300/90 font-mono text-xs items-center p-1 px-2 bg-stone-900/50 rounded-full border border-amber-300/20 flex-shrink-0">
+                    <span className="font-serif font-bold text-white mr-2">Map Center:</span>
+                    <span className="mr-2">Lng: **{mapCenter.lng}**</span>
+                    <span>Lat: **{mapCenter.lat}**</span>
+                </div>
+
+                {/* Data Acquisition Toggle Button (Now serving as 'Open Data Entry' button) */}
                 <button
-                    onClick={resetMapView}
-                    className="absolute bottom-4 right-4 bg-stone-800/80 hover:bg-stone-900 text-amber-300 font-serif py-2 px-6 rounded-full shadow-2xl z-20 transition duration-300 border border-white/20"
+                    onClick={() => setIsCoordinateFormOpen(prev => !prev)}
+                    className={`font-serif font-bold py-1.5 px-3 rounded-full shadow-lg transition duration-500 tracking-wider text-xs sm:text-sm flex-shrink-0
+                        ${isCoordinateFormOpen
+                            ? 'bg-amber-600 text-stone-900 border border-amber-300'
+                            : collectedCoordinates.length > 0
+                                ? 'bg-red-900 text-amber-300 border border-amber-300/50'
+                                : 'bg-blue-900 hover:bg-blue-800 text-amber-300 border border-amber-300/50'
+                        }`}
                 >
-                    Reset Map View 🌍
+                    {isCoordinateFormOpen ? 'Close Data Entry' : 'Open Data Entry'} ({collectedCoordinates.length} / {MAX_COLLECTED_POINTS})
                 </button>
-            )}
 
-            {/* Clear All Map Interaction Button (Bottom Right - Shifted left) */}
-            {(routePoints.length > 0 || route) && (
-                <button
-                    onClick={() => {
-                        setRoutePoints([]);
-                        dispatch(setRoute(null));
-                        // Clear the route line from map source if it exists
-                        if (map.current.getSource('route-source')) {
-                            map.current.getSource('route-source').setData({ type: 'FeatureCollection', features: [] });
-                        }
-                    }}
-                    // Adjusted position to be left of the Reset Map View button
-                    className="absolute bottom-4 right-52 bg-red-900/80 hover:bg-red-800 text-amber-300 font-serif py-2 px-4 rounded-full shadow-2xl z-20 transition duration-300 border border-amber-300/50"
-                >
-                    Clear Route/Points
-                </button>
-            )}
+                {/* Clear Route/Points Button (Visibility based on state) */}
+                {(routePoints.length > 0 || route) && (
+                    <button
+                        onClick={() => {
+                            setRoutePoints([]);
+                            dispatch(setRoute(null));
+                            if (map.current?.getSource('route-source')) {
+                                map.current.getSource('route-source').setData({ type: 'FeatureCollection', features: [] });
+                            }
+                        }}
+                        className="bg-red-900/80 hover:bg-red-800 text-amber-300 font-serif py-1.5 px-3 rounded-full shadow-lg transition duration-300 border border-amber-300/50 text-xs sm:text-sm flex-shrink-0"
+                    >
+                        Clear Route
+                    </button>
+                )}
 
-            {/* CATEGORY FILTER BUTTONS (Bottom Center) */}
-            <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-blue-950/70 backdrop-blur-sm p-2 rounded-xl shadow-2xl z-10 flex space-x-2 border border-amber-300/30">
+                {/* Separator / Visual Break */}
+                <div className="border-l border-amber-300/50 h-6 mx-1 flex-shrink-0"></div>
+
+                {/* Category Filters (The rest of the bar) - RESTORED */}
                 {CATEGORY_OPTIONS.map(category => (
                     <button
                         key={category}
                         onClick={() => handleCategoryClick(category)}
-                        className={`text-xs font-serif py-1 px-4 h-15 rounded-full transition duration-150 tracking-wide
+                        className={`text-xs font-serif py-1 px-2 h-auto rounded-full transition duration-150 tracking-wide flex-shrink-0
                             ${activeCategory === category
-                                ? 'bg-amber-600 text-stone-900 shadow-md border border-amber-300' // Selected: Gold/Amber
-                                : 'bg-stone-900/50 text-amber-300/70 hover:bg-blue-900'}` // Default: Dark/Transparent
+                                ? 'bg-amber-600 text-stone-900 shadow-md border border-amber-300'
+                                : 'bg-stone-900/50 text-amber-300/70 hover:bg-blue-900'}`
                         }
                     >
                         {category}
                     </button>
                 ))}
-            </div>
 
-            {/* Coordinate Display & Status Overlay (Top Right) */}
-            <div className="absolute top-4 right-4 bg-stone-950/70 backdrop-blur-sm p-4 rounded-xl shadow-2xl z-10 text-base font-mono text-amber-300 border border-amber-300/30" style={{ maxWidth: '300px' }}>
-                <p className="text-lg font-serif tracking-widest text-white mb-2">Imperial Map Console</p>
-                <p className="text-amber-300/90"><span className="text-gray-500">Longitude:</span> **{mapCenter.lng}**</p>
-                <p className="text-amber-300/90"><span className="text-gray-500">Latitude:</span> **{mapCenter.lat}**</p>
-
-                {getCollectedCoordsDisplay()}
-                {getAllClickedCoordsDisplay()}
             </div>
 
             {/* Info Panel UI (Building/Feature Info) */}
